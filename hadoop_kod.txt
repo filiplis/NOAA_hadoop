@@ -1,0 +1,132 @@
+### pobranie danych pogodowych z ftp.ncdc.noaa.gov dla stacji z Polski w latach 2017-2019 i wrzucenie ich do hdfs i w tabele Hive
+
+### w konsoli w pyspark
+
+from pyspark.sql.functions import concat, col, lit, udf
+import subprocess
+import ftplib
+
+# pobiera liste stacji z Polski z tabeli w hive
+stacje = spark.sql("select usaf, wban from s26443.stations where ctry = 'PL'")
+
+# tworzy liste pelnych nazw wszystkich mozliwych stacji do pobrania dla lat 2017-2019
+stacje = stacje.withColumn("glued_2017", concat(col("usaf"), lit("-"), col("wban"), lit("-2017.gz"))).withColumn("glued_2018", concat(col("usaf"), lit("-"), col("wban"), lit("-2018.gz"))).withColumn("glued_2019", concat(col("usaf"), lit("-"), col("wban"), lit("-2019.gz")))
+
+stacje_2017 = stacje.select('glued_2017').rdd.flatMap(lambda x: x).collect()
+stacje_2018 = stacje.select('glued_2018').rdd.flatMap(lambda x: x).collect()
+stacje_2019 = stacje.select('glued_2019').rdd.flatMap(lambda x: x).collect()
+
+
+ftp = ftplib.FTP("ftp.ncdc.noaa.gov") 
+ftp.login("anonymous", "") 
+
+#pobiera kazdy rok osobno
+### 2017 
+path = '/pub/data/noaa/2017'
+ftp.cwd(path)
+
+# bierze liste plikow na serwerze ftp i wyciaga czesc wspolna ze wszystkimi mozliwymi stacjami w Polsce
+stacje_ftp = []
+ftp.retrlines('NLST ', stacje_ftp.append)
+stacje_to_download = []
+stacje_to_download = list(set(stacje_ftp) & set(stacje_2017))
+
+# sciaga plik, rozpakowuje, przeksztalca w zjadliwa forme (rozdziela kolumny spacja) do pliku '*_str', wrzuca go do hdfs
+for plik in stacje_to_download:
+	ftp.retrbinary("RETR " + plik ,open(plik, 'wb').write)
+	subprocess.call(['gunzip', plik])
+	subprocess.call(['java', '-classpath', '.', 'ishJava', plik[:-3], plik[:-3]+'_str'])
+	subprocess.call(['rm', plik[:-3]])
+	subprocess.call(['hdfs', 'dfs', '-moveFromLocal', '-f', plik[:-3]+'_str', 'hdfs:///user/s26443/NOAA/data'])
+	
+### 2018
+path = '/pub/data/noaa/2018'
+ftp.cwd(path)
+
+stacje_ftp = []
+ftp.retrlines('NLST ', stacje_ftp.append)
+stacje_to_download = []
+stacje_to_download = list(set(stacje_ftp) & set(stacje_2018))
+
+for plik in stacje_to_download:
+	ftp.retrbinary("RETR " + plik ,open(plik, 'wb').write) 
+	subprocess.call(['gunzip', plik])
+	subprocess.call(['java', '-classpath', '.', 'ishJava', plik[:-3], plik[:-3]+'_str'])
+	subprocess.call(['rm', plik[:-3]])
+	subprocess.call(['hdfs', 'dfs', '-moveFromLocal', '-f', plik[:-3]+'_str', 'hdfs:///user/s26443/NOAA/data'])
+
+### 2019
+path = '/pub/data/noaa/2019'
+ftp.cwd(path)
+
+stacje_ftp = []
+ftp.retrlines('NLST ', stacje_ftp.append)
+stacje_to_download = []
+stacje_to_download = list(set(stacje_ftp) & set(stacje_2019))
+
+for plik in stacje_to_download:
+	ftp.retrbinary("RETR " + plik ,open(plik, 'wb').write) 
+	subprocess.call(['gunzip', plik])
+	subprocess.call(['java', '-classpath', '.', 'ishJava', plik[:-3], plik[:-3]+'_str'])
+	subprocess.call(['rm', plik[:-3]])
+	subprocess.call(['hdfs', 'dfs', '-moveFromLocal', '-f', plik[:-3]+'_str', 'hdfs:///user/s26443/NOAA/data'])
+
+ftp.quit()
+
+
+
+
+###############
+
+# tworzenie tabeli z textfile; w Hive
+
+create external table s26443.NOAA_PL (
+USAF int,
+WBAN int,
+YR_MODAHRMN string,
+DIR int,
+SPD int,
+GUS int,
+CLG int,
+SKC string,
+L int,
+M int,
+H int,
+VSB float,
+MW1 int, MW2 int, MW3 int, MW4 int, 
+AW1 int, AW2 int, AW3 int, AW4 int,
+W int,
+TEMP float,
+DEWP float,
+SLP int,
+ALT float,
+STP int,
+MAX float,
+MIN float,
+PCP01 float,
+PCP06 float,
+PCP24 float,
+PCPXX float,
+SD float
+) 
+ROW FORMAT DELIMITED 
+FIELDS TERMINATED by ' '
+stored as textfile 
+location '/user/s26443/NOAA/data2'
+tblproperties ("skip.header.line.count"="1");
+
+#### hive
+
+# kwerenda generujaca tabele do raportu
+
+select rok, miesiac, if(min(min)<min(max), min(min), min(max)) as Min_Temp_F, 
+	round(avg(avg_temp),2) as avg_temp_F,
+	if(max(min)>max(max), max(min), max(max)) as Max_Temp_F
+from (
+	select substring(yr_modahrmn, 1,4) as rok, substring(yr_modahrmn, 5,2) as miesiac, max, min,
+  	if(min is null, max, if(max is null, min, (min+max)/2 )) as avg_temp 
+	from noaa_pl 
+	where (max < 212 or max is null) and (min < 212 or min is null) and (min is not null or max is not null)
+) s1
+group by rok, miesiac;
+
